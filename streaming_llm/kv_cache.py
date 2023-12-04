@@ -1,4 +1,5 @@
 import torch
+from annoy import AnnoyIndex
 
 
 def slice2d(x, start, end):
@@ -36,6 +37,7 @@ class StartRecentKVCache:
         self.v_seq_dim = v_seq_dim
         self.k_slice = DIM_TO_SLICE[k_seq_dim]
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
+        self.db = AnnoyIndex(768, 'angular')
 
     def __call__(self, past_key_values):
         if past_key_values is None:
@@ -69,18 +71,7 @@ class StartRecentKVCache:
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
         if seq_len + num_coming <= self.cache_size:
             return past_key_values
-        # TODO: grab evicted token k-v pairs for reuse
-        # evicted = [
-        #     [
-        #         self.k_slice(
-        #             k, seq_len - self.recent_size, seq_len - self.recent_size + num_coming
-        #         ),
-        #         self.v_slice(
-        #             v, seq_len - self.recent_size, seq_len - self.recent_size + num_coming
-        #         ),
-        #     ]
-        #     for k, v in past_key_values
-        # ]
+
         return [
             [
                 torch.cat(
@@ -104,6 +95,54 @@ class StartRecentKVCache:
             ]
             for k, v in past_key_values
         ]
+    
+    # TODO: pass in input IDs
+    # might also need to keep another cache 
+    def evict_for_space_annoy(self, past_key_values, num_coming):
+        if past_key_values is None:
+            return None
+        seq_len = past_key_values[0][0].size(self.k_seq_dim)
+        if seq_len + num_coming <= self.cache_size:
+            return past_key_values
+        
+        # grab evicted token k-v pairs for reuse
+        evicted = [
+            [
+                self.k_slice(
+                    k, self.start_size, seq_len - self.recent_size + num_coming
+                ),
+                self.v_slice(
+                    v, self.start_size, seq_len - self.recent_size + num_coming
+                ),
+            ]
+            for k, v in past_key_values
+        ]
+        # TODO: add evicted tokens to DB
+        
+        return [
+            [
+                torch.cat(
+                    [
+                        self.k_slice(k, 0, self.start_size),
+                        self.k_slice(
+                            k, seq_len - self.recent_size + num_coming, seq_len
+                        ),
+                    ],
+                    dim=self.k_seq_dim,
+                ),
+                torch.cat(
+                    [
+                        self.v_slice(v, 0, self.start_size),
+                        self.v_slice(
+                            v, seq_len - self.recent_size + num_coming, seq_len
+                        ),
+                    ],
+                    dim=self.v_seq_dim,
+                ),
+            ]
+            for k, v in past_key_values
+        ]
+
 
     def evict_range(self, past_key_values, start, end):
         if past_key_values is None:

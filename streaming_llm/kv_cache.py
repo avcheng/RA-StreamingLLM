@@ -1,6 +1,7 @@
 import torch
-from annoy import AnnoyIndex
-
+import faiss
+import redis
+import pickle
 
 def slice2d(x, start, end):
     return x[:, :, start:end, ...]
@@ -37,7 +38,9 @@ class StartRecentKVCache:
         self.v_seq_dim = v_seq_dim
         self.k_slice = DIM_TO_SLICE[k_seq_dim]
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
-        self.db = AnnoyIndex(768, 'angular')
+        self.redis_id = 0
+        self.redis_cache = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        self.index = faiss.IndexFlatL2(768) # TODO: change to 1024
 
     def __call__(self, past_key_values):
         if past_key_values is None:
@@ -95,18 +98,19 @@ class StartRecentKVCache:
             ]
             for k, v in past_key_values
         ]
-    
-    # TODO: pass in input IDs
-    # might also need to keep another cache 
-    def evict_for_space_annoy(self, past_key_values, num_coming):
+
+    def evict_for_space_db(self, past_key_values, past_tokens, num_coming):
         if past_key_values is None:
-            return None
+            return past_key_values, past_tokens
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
         if seq_len + num_coming <= self.cache_size:
-            return past_key_values
-        
-        # grab evicted token k-v pairs for reuse
-        evicted = [
+            return past_key_values, past_tokens
+
+        # TODO Figure out which k-v pairs should be evicted
+        # TODO Figure out way to batch evicted tokens into batches of a certain (TBD) size
+        # TODO Figure out way to identify which tokens/k-v pairs have already been saved to redis
+        # grab evicted tokens and k-v pairs for reuse
+        evicted_kv = [
             [
                 self.k_slice(
                     k, self.start_size, seq_len - self.recent_size + num_coming
@@ -117,8 +121,23 @@ class StartRecentKVCache:
             ]
             for k, v in past_key_values
         ]
-        # TODO: add evicted tokens to DB
-        
+        if past_key_values is not None and past_tokens is not None:
+            evicted_tokens = past_tokens[:seq_len - self.recent_size + num_coming - self.start_size]
+
+            # Add serialize tokens/k-v pairs to redis
+            serialized = pickle.dumps((evicted_kv, evicted_tokens))
+            self.redis_cache.set(self.redis_id, serialized)
+
+            # Generate document embedding of evicted tokens
+            embedding = torch.mean(evicted_tokens, dim=1)
+
+            # Add document embedding to index
+            self.index.add(embedding)
+            self.index.add_with_ids(embedding, self.redis_id)
+
+            self.redis_id += 1
+
+
         return [
             [
                 torch.cat(

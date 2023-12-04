@@ -54,23 +54,28 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         if pred_token_idx == tokenizer.eos_token_id:
             break
     print(" ".join(generated_text[pos:]), flush=True)
-    return past_key_values
+    return past_key_values, input_ids + generated_ids
 
 
 @torch.no_grad()
 def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
     past_key_values = None
-    for idx, prompt in enumerate(prompts):
+    past_tokens = None
+    # for idx, prompt in enumerate(prompts):
+    while True:
+        prompt = input("Your prompt ('quit' to exit): ")
+        if prompt == "quit":
+            break
         prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
+        print("\n\nASSISTANT: ", end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
-            past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+            past_key_values = kv_cache.evict_for_space_db(past_key_values, past_tokens, space_needed)
 
-        past_key_values = greedy_generate(
+        past_key_values, past_tokens = greedy_generate(
             model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
         )
 

@@ -69,6 +69,18 @@ class StartRecentKVCache:
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
         if seq_len + num_coming <= self.cache_size:
             return past_key_values
+        # TODO: grab evicted token k-v pairs for reuse
+        # evicted = [
+        #     [
+        #         self.k_slice(
+        #             k, seq_len - self.recent_size, seq_len - self.recent_size + num_coming
+        #         ),
+        #         self.v_slice(
+        #             v, seq_len - self.recent_size, seq_len - self.recent_size + num_coming
+        #         ),
+        #     ]
+        #     for k, v in past_key_values
+        # ]
         return [
             [
                 torch.cat(
@@ -98,6 +110,14 @@ class StartRecentKVCache:
             return None
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
         assert start <= end and end <= seq_len
+        # TODO: grab evicted token k-v pairs for reuse
+        # evicted = [
+        #     [
+        #         self.k_slice(k, start, end),
+        #         self.v_slice(v, start, end),
+        #     ]
+        #     for k, v in past_key_values
+        # ]
         return [
             [
                 torch.cat(

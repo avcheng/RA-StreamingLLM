@@ -1,18 +1,16 @@
+from streaming_llm.enable_streaming_llm import enable_streaming_llm
+from streaming_llm.utils import load, download_url, load_jsonl
+from tqdm import tqdm
+import sys
+import re
+import time
+import os
+import json
+import argparse
+import torch
 import warnings
 
 warnings.filterwarnings("ignore")
-
-import torch
-import argparse
-import json
-import os
-import time
-import re
-import sys
-
-from tqdm import tqdm
-from streaming_llm.utils import load, download_url, load_jsonl
-from streaming_llm.enable_streaming_llm import enable_streaming_llm
 
 
 @torch.no_grad()
@@ -21,20 +19,24 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         input_ids=input_ids,
         past_key_values=past_key_values,
         use_cache=True,
+        output_hidden_states=True,
     )
     past_key_values = outputs.past_key_values
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     generated_ids = [pred_token_idx.item()]
+    embeddings = [outputs.hidden_states[-1]]
     pos = 0
     for _ in range(max_gen_len - 1):
         outputs = model(
             input_ids=pred_token_idx,
             past_key_values=past_key_values,
             use_cache=True,
+            output_hidden_states=True,
         )
         past_key_values = outputs.past_key_values
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         generated_ids.append(pred_token_idx.item())
+        embeddings.extend(outputs.hidden_states[-1])
         generated_text = (
             tokenizer.decode(
                 generated_ids,
@@ -54,13 +56,13 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         if pred_token_idx == tokenizer.eos_token_id:
             break
     print(" ".join(generated_text[pos:]), flush=True)
-    return past_key_values, input_ids + generated_ids
+    return past_key_values, input_ids + generated_ids, embeddings
 
 
 @torch.no_grad()
 def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
     past_key_values = None
-    past_tokens = None
+    past_embeddings = None
     # for idx, prompt in enumerate(prompts):
     while True:
         prompt = input("Your prompt ('quit' to exit): ")
@@ -73,9 +75,10 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
         seq_len = input_ids.shape[1]
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
-            past_key_values = kv_cache.evict_for_space_db(past_key_values, past_tokens, space_needed)
+            past_key_values = kv_cache.evict_for_space_db(
+                past_key_values, past_embeddings, space_needed)
 
-        past_key_values, past_tokens = greedy_generate(
+        past_key_values, past_tokens, past_embeddings = greedy_generate(
             model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
         )
 

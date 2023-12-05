@@ -1,7 +1,7 @@
 from streaming_llm.kv_cache import StartRecentKVCache
 
 
-def enable_streaming_llm(model, start_size, recent_size):
+def enable_streaming_llm(model, start_size, recent_size, use_retrieval):
     print(model.config.model_type)
     if "llama" in model.config.model_type:
         k_seq_dim = v_seq_dim = 2
@@ -35,5 +35,6 @@ def enable_streaming_llm(model, start_size, recent_size):
         recent_size=recent_size,
         k_seq_dim=k_seq_dim,
         v_seq_dim=v_seq_dim,
+        use_retrieval=use_retrieval,
     )
     return kv_cache

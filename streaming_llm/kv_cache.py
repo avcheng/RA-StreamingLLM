@@ -35,6 +35,7 @@ class StartRecentKVCache:
         recent_size=512,
         k_seq_dim=2,
         v_seq_dim=2,
+        use_retrieval=False,
     ):
         print(f"StartRecentKVCache: {start_size}, {recent_size}")
         self.start_size = start_size
@@ -44,27 +45,30 @@ class StartRecentKVCache:
         self.v_seq_dim = v_seq_dim
         self.k_slice = DIM_TO_SLICE[k_seq_dim]
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
-        self.redis_id = 0
-        self.redis_client = redis.Redis(
-            host='localhost', port=6379, decode_responses=True)
 
-        schema = (
-            VectorField(
-                "embedding",
-                "FLAT",
-                {
-                    "TYPE": "FLOAT32",
-                    "DIM": VECTOR_SIZE,
-                    "DISTANCE_METRIC": "COSINE",
-                }
-            ),
-            TagField("kv_id")
-        )
-        idx_def = IndexDefinition(
-            prefix=["key:"], index_type=IndexType.HASH)
-        self.index = "idx"
-        self.redis_client.ft(self.index).create_index(
-            schema, definition=idx_def)
+        self.use_retrieval = use_retrieval
+        if self.use_retrieval:
+            self.redis_id = 0
+            self.redis_client = redis.Redis(
+                host='localhost', port=6379, decode_responses=True)
+
+            schema = (
+                VectorField(
+                    "embedding",
+                    "FLAT",
+                    {
+                        "TYPE": "FLOAT32",
+                        "DIM": VECTOR_SIZE,
+                        "DISTANCE_METRIC": "COSINE",
+                    }
+                ),
+                TagField("kv_id")
+            )
+            idx_def = IndexDefinition(
+                prefix=["key:"], index_type=IndexType.HASH)
+            self.index = "idx"
+            self.redis_client.ft(self.index).create_index(
+                schema, definition=idx_def)
 
     def __call__(self, past_key_values):
         if past_key_values is None:
@@ -172,23 +176,24 @@ class StartRecentKVCache:
         if seq_len + num_coming <= self.cache_size:
             return past_key_values, past_emb
 
-        # TODO Figure out which k-v pairs should be evicted
-        # TODO Figure out way to batch evicted tokens into batches of a certain (TBD) size
-        # TODO Figure out way to identify which tokens/k-v pairs have already been saved to redis
-        # grab evicted tokens and k-v pairs for reuse
-        evicted_kv = [
-            [
-                self.k_slice(
-                    k, self.start_size, seq_len - self.recent_size + num_coming
-                ),
-                self.v_slice(
-                    v, self.start_size, seq_len - self.recent_size + num_coming
-                ),
+        if self.use_retrieval:
+            # TODO Figure out which k-v pairs should be evicted
+            # TODO Figure out way to batch evicted tokens into batches of a certain (TBD) size
+            # TODO Figure out way to identify which tokens/k-v pairs have already been saved to redis
+            # grab evicted tokens and k-v pairs for reuse
+            evicted_kv = [
+                [
+                    self.k_slice(
+                        k, self.start_size, seq_len - self.recent_size + num_coming
+                    ),
+                    self.v_slice(
+                        v, self.start_size, seq_len - self.recent_size + num_coming
+                    ),
+                ]
+                for k, v in past_key_values
             ]
-            for k, v in past_key_values
-        ]
-        evicted_emb = past_emb[:seq_len + num_coming - self.cache_size]
-        self.add_to_kv_redis_cache(evicted_kv, evicted_emb)
+            evicted_emb = past_emb[:seq_len + num_coming - self.cache_size]
+            self.add_to_kv_redis_cache(evicted_kv, evicted_emb)
 
         return [
             [

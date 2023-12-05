@@ -103,7 +103,7 @@ def main(args):
 
     if args.enable_streaming:
         kv_cache = enable_streaming_llm(
-            model, start_size=args.start_size, recent_size=args.recent_size
+            model, start_size=args.start_size, recent_size=args.recent_size, use_retrieval=args.use_retrieval
         )
     else:
         kv_cache = None
@@ -125,6 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_streaming", action="store_true")
     parser.add_argument("--start_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=2000)
+    parser.add_argument("--use_retrieval", type=bool, default=False)
     args = parser.parse_args()
 
     main(args)

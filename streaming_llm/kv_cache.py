@@ -171,10 +171,10 @@ class StartRecentKVCache:
 
     def evict_for_space_db(self, past_key_values, past_emb, num_coming):
         if past_key_values is None:
-            return past_key_values, past_emb
+            return past_key_values
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
         if seq_len + num_coming <= self.cache_size:
-            return past_key_values, past_emb
+            return past_key_values
 
         if self.use_retrieval:
             # TODO Figure out which k-v pairs should be evicted

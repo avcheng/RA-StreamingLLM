@@ -4,15 +4,21 @@ warnings.filterwarnings("ignore")
 
 import torch
 import argparse
-import json
-import os
-import time
-import re
-import sys
 
 from tqdm import tqdm
 from streaming_llm.utils import load, download_url, load_jsonl
 from streaming_llm.enable_streaming_llm import enable_streaming_llm
+from llama_index import (
+    VectorStoreIndex, 
+    StorageContext, 
+    ServiceContext, 
+    Document, 
+    load_index_from_storage,
+    set_global_service_context
+)
+from llama_index.llms import HuggingFaceLLM
+from llama_index.prompts import PromptTemplate
+from llama_index.node_parser import SimpleNodeParser
 
 
 @torch.no_grad()
@@ -58,11 +64,38 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
 
 
 @torch.no_grad()
-def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
+def streaming_inference(model, tokenizer, prompts, service_context=None, kv_cache=None, max_gen_len=1000):
     past_key_values = None
-    for idx, prompt in enumerate(prompts):
-        prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
+    parser = SimpleNodeParser.from_defaults(chunk_size=1024, chunk_overlap=20)
+
+    try:
+        # Rebuild storage context
+        storage_context = StorageContext.from_defaults(persist_dir="./storage")
+        # Try to load the index from storage
+        index = load_index_from_storage(storage_context)
+    except FileNotFoundError:
+        # If index not found, create a new one
+        index = VectorStoreIndex.from_documents([Document(text="")])
+        # Persist index to disk
+        index.storage_context.persist()
+
+    while True:
+        prompt = input("Your input: ")
+
+        print("\n\nASSISTANT: ", end="")
+
+        new_document = Document(text=prompt)
+        nodes = parser.get_nodes_from_documents([new_document])
+
+        # Add to llama index
+        index.insert_nodes(nodes)
+
+        # Get context from llama index
+        query_engine = index.as_query_engine(response_mode="compact", service_context=service_context)
+        context = query_engine.query(prompt)
+
+
+        prompt = "USER: Using the context: " + context + ". Answer the prompt: " + prompt + "\n\nASSISTANT: "
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
@@ -78,20 +111,6 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
 def main(args):
     model_name_or_path = args.model_name_or_path
     model, tokenizer = load(model_name_or_path)
-    test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
-    print(f"Loading data from {test_filepath} ...")
-
-    if not os.path.exists(test_filepath):
-        download_url(
-            "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl",
-            args.data_root,
-        )
-        os.rename(os.path.join(args.data_root, "question.jsonl"), test_filepath)
-
-    list_data = load_jsonl(test_filepath)
-    prompts = []
-    for sample in list_data:
-        prompts += sample["turns"]
 
     if args.enable_streaming:
         kv_cache = enable_streaming_llm(
@@ -100,10 +119,33 @@ def main(args):
     else:
         kv_cache = None
 
+    query_wrapper_prompt = PromptTemplate(
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{query_str}\n\n### Response:"
+    )
+
+    llm = HuggingFaceLLM(
+        context_window=2048,
+        max_new_tokens=256,
+        generate_kwargs={"temperature": 0.25, "do_sample": False},
+        query_wrapper_prompt=query_wrapper_prompt,
+        tokenizer_name="Writer/camel-5b-hf",
+        model_name="Writer/camel-5b-hf",
+        device_map="auto",
+        tokenizer_kwargs={"max_length": 2048},
+        # uncomment this if using CUDA to reduce memory usage
+        # model_kwargs={"torch_dtype": torch.float16, "offload_folder": "li_offload"},
+        model_kwargs={"offload_folder": "li_offload"},
+    )
+    service_context = ServiceContext.from_defaults(chunk_size=512, llm=llm, embed_model='local')
+    set_global_service_context(service_context)
+
     streaming_inference(
         model,
         tokenizer,
-        prompts,
+        None,
+        service_context,
         kv_cache,
     )
 

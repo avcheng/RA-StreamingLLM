@@ -28,6 +28,7 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         past_key_values=past_key_values,
         use_cache=True,
     )
+    output = ""
     past_key_values = outputs.past_key_values
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
     generated_ids = [pred_token_idx.item()]

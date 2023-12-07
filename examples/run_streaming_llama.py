@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 
 
 @torch.no_grad()
-def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
+def start_generate(model, input_ids, past_key_values):
     outputs = model(
         input_ids=input_ids,
         past_key_values=past_key_values,
@@ -23,9 +23,14 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
     )
     past_key_values = outputs.past_key_values
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    generated_ids = [pred_token_idx.item()]
-    embeddings = [outputs.hidden_states[0]]
+    embeddings = outputs.hidden_states[0]
+    return past_key_values, pred_token_idx, embeddings
+
+
+@torch.no_grad()
+def greedy_generate(model, tokenizer, past_key_values, pred_token_idx, embeddings, max_gen_len):
     pos = 0
+    generated_ids = [pred_token_idx.item()]
     for _ in range(max_gen_len - 1):
         outputs = model(
             input_ids=pred_token_idx,
@@ -36,7 +41,7 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         past_key_values = outputs.past_key_values
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         generated_ids.append(pred_token_idx.item())
-        embeddings.extend(outputs.hidden_states[0])
+        embeddings = torch.cat([embeddings, outputs.hidden_states[0]], dim=1)
         generated_text = (
             tokenizer.decode(
                 generated_ids,
@@ -70,15 +75,21 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
         prompt = "USER: " + prompt + "\n\nASSISTANT: "
         print("\n\nASSISTANT: ", end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to(model.device)
+        input_ids = input_ids.to('cuda')
         seq_len = input_ids.shape[1]
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
             past_key_values = kv_cache.evict_for_space_db(
                 past_key_values, past_embeddings, space_needed)
 
+        past_key_values, pred_token_idx, embeddings = start_generate(
+            model, input_ids, past_key_values)
+
+        past_key_values = kv_cache.add_relevant_kv_to_cache(
+                past_key_values, embeddings, 5)
+
         past_key_values, past_embeddings = greedy_generate(
-            model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
+            model, tokenizer, past_key_values, pred_token_idx, embeddings, max_gen_len=max_gen_len
         )
 
 
@@ -124,7 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_streaming", action="store_true")
     parser.add_argument("--start_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=2000)
-    parser.add_argument("--use_retrieval", type=bool, default=False)
+    parser.add_argument("--use_retrieval", action="store_true")
     args = parser.parse_args()
 
     main(args)

@@ -77,7 +77,7 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
-        
+
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
             past_key_values = kv_cache.evict_for_space_db(
@@ -86,8 +86,9 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
         past_key_values, pred_token_idx, embeddings = start_generate(
             model, input_ids, past_key_values)
 
-        past_key_values = kv_cache.add_relevant_kv_to_cache(
-                past_key_values, embeddings, 5)
+        if kv_cache:
+            past_key_values = kv_cache.add_relevant_kv_to_cache(
+                    past_key_values, embeddings, 5)
 
         past_key_values, past_embeddings = greedy_generate(
             model, tokenizer, past_key_values, pred_token_idx, embeddings, max_gen_len=max_gen_len

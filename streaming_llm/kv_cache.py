@@ -1,10 +1,10 @@
+import io
 import pickle
 import sys
 
 import chromadb
 import redis
 import torch
-
 
 def slice2d(x, start, end):
     return x[:, :, start:end, ...]
@@ -25,7 +25,7 @@ DIM_TO_SLICE = {
 }
 
 VECTOR_SIZE = 5120
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 
 
 class StartRecentKVCache:
@@ -51,7 +51,10 @@ class StartRecentKVCache:
             self.redis_id = 0
             self.redis_client = self.reset_redis_connection()
             self.redis_client.ping()
-            self.collection = chromadb.Client().create_collection(name="kv_cache")
+            settings = chromadb.get_settings()
+            settings.allow_reset = True
+            self.chroma_client = chromadb.Client(settings=settings)
+            self.collection = self.chroma_client.get_or_create_collection("kv_cache")
 
     def __call__(self, past_key_values):
         if past_key_values is None:
@@ -84,7 +87,7 @@ class StartRecentKVCache:
         return redis.Redis(
             host='localhost',
             port=6379,
-            decode_responses=True,
+            decode_responses=False,
             health_check_interval=15,
             socket_keepalive=True,
         )
@@ -105,8 +108,7 @@ class StartRecentKVCache:
             n_results=n
         )
 
-        # TODO results["ids"] is a list of list of ids so figure out how to get the ids that we want
-        return [self.redis_client.get(id) for id in results["ids"][0]]
+        return self.redis_client.mget(results["ids"][0])
 
     def add_to_kv_redis_cache(self, kv_cache, embedding: torch.Tensor):
         """Adds the kv cache and embedding to redis
@@ -116,21 +118,34 @@ class StartRecentKVCache:
             embedding (torch.Tensor): embedding of the k-v pairs
         """
         # Store k-v pairs in redis
-        serialized = pickle.dumps(kv_cache)
-        print(f"{len(serialized)} bytes long...")
+        stacked_cache = torch.stack([torch.stack((k, v)) for (k, v) in kv_cache])
+        print(f"Shape of stacked_cache {stacked_cache.size()}")
+        print(f"Dtype of stacked_cache {stacked_cache.dtype}")
+        print(f"Size of stacked_cache: {stacked_cache.element_size() * stacked_cache.nelement()}")
+        
+        # Serialize the tensor to a bytestring
+        bytestring_buffer = io.BytesIO()
+        torch.save(stacked_cache.flatten().tolist(), bytestring_buffer)
+
+        # Get the bytestring from the buffer
+        bytestring = bytestring_buffer.getvalue()
+        print(f"bytestring {len(bytestring)} bytes long...")
         self.redis_id += 1
+
+        obj = pickle.dumps(stacked_cache.flatten())
         while True:
             try:
-                pass
+                # break
                 # TODO Need to reduce memory requirements for serialized object because it is too big rn
-                self.redis_client.set(self.redis_id, serialized)
+                self.redis_client.set(self.redis_id, obj)
                 break
             except redis.exceptions.ConnectionError:
                 print("Redis connection error, resetting connection")
                 self.redis_client = self.reset_redis_connection()
 
         # Add document embedding to index
-        self.collection.add(self.redis_id, embedding.tolist())
+        doc_emb = embedding.mean(dim=(0, 1)).flatten()
+        self.collection.add([str(self.redis_id)], [doc_emb.tolist()])
         print(f"{self.collection.count()} documents in collection")
 
     def add_relevant_kv_to_cache(self, past_key_values, embeddings: torch.Tensor, n):
@@ -143,11 +158,22 @@ class StartRecentKVCache:
         if self.use_retrieval:
             prompt_embedding = embeddings.mean(dim=1).flatten()
             nearest_neighbors = self.get_nearest_neighbors(prompt_embedding, n)
-            for neighbor in nearest_neighbors:
+            neighbor_tensors = []
+            for neighbor in reversed(nearest_neighbors):
+                # kv_cache = torch.frombuffer(neighbor, dtype=torch.float16)
                 kv_cache = pickle.loads(neighbor)
-                print(len(kv_cache))
+                kv_cache = kv_cache.reshape(40, 2, 1, 40, -1, 128)
+                neighbor_tensors.append(kv_cache)
+                print(kv_cache.size())
 
-        return past_key_values
+            if neighbor_tensors:
+                neighbor_tensors = torch.cat(neighbor_tensors, dim=-2)
+
+                pkv = torch.stack([torch.stack((k, v)) for (k, v) in past_key_values])
+                pkv = torch.cat([pkv[:, :, :, :, :4, :], neighbor_tensors, pkv[:, :, :, :, 4:, :]], dim=-2)
+                print(f"Shape of pkv {pkv.size()}")
+                past_key_values = map(lambda x: (x[0], x[1]), list(pkv))
+        return list(past_key_values)
 
         # return [
         #     [
@@ -208,9 +234,8 @@ class StartRecentKVCache:
         if past_key_values is None:
             return past_key_values
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
-        print(
-            f"{len(past_key_values)} k-v pairs in cache with key vector of size {past_key_values[0][0].size()} with memory size {past_key_values[0][0].element_size() * past_key_values[0][0].nelement()}")
         if seq_len + num_coming <= self.cache_size:
+            print(f"Embedding size {past_emb.mean(dim=(0, 1)).size()}")
             return past_key_values
 
         if self.use_retrieval:
@@ -222,14 +247,11 @@ class StartRecentKVCache:
                 evicted_kv = [
                     [
                         self.k_slice(
-                            k, -num_new_tokens + batch * BATCH_SIZE, -
-                            num_new_tokens + (batch + 1) * BATCH_SIZE
-                        ).tolist(),
+                            k, -num_new_tokens + (batch * BATCH_SIZE), -num_new_tokens + ((batch + 1) * BATCH_SIZE)
+                        ),
                         self.v_slice(
-                            v, -num_new_tokens + batch *
-                            BATCH_SIZE, num_new_tokens +
-                            (batch + 1) * BATCH_SIZE
-                        ).tolist(),
+                            v, -num_new_tokens + (batch * BATCH_SIZE), -num_new_tokens + ((batch + 1) * BATCH_SIZE)
+                        ),
                     ]
                     for k, v in past_key_values
                 ]
@@ -285,3 +307,9 @@ class StartRecentKVCache:
             ]
             for k, v in past_key_values
         ]
+    
+    def clear_cache(self):
+        self.redis_client.flushall()
+        self.redis_client = self.reset_redis_connection()
+        self.chroma_client.reset()
+        self.collection = self.chroma_client.get_or_create_collection("kv_cache")

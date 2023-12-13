@@ -61,6 +61,7 @@ def load(model_name_or_path):
         torch_dtype=torch.float16,
         trust_remote_code=True,
         offload_folder="offload",
+        offload_state_dict=True
     )
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:

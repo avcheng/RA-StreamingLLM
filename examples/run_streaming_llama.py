@@ -1,40 +1,47 @@
+from streaming_llm.enable_streaming_llm import enable_streaming_llm
+from streaming_llm.utils import load, download_url, load_jsonl
+from tqdm import tqdm
+import sys
+import re
+import time
+import os
+import json
+import argparse
+import torch
 import warnings
 
 warnings.filterwarnings("ignore")
 
-import torch
-import argparse
-import json
-import os
-import time
-import re
-import sys
-
-from tqdm import tqdm
-from streaming_llm.utils import load, download_url, load_jsonl
-from streaming_llm.enable_streaming_llm import enable_streaming_llm
-
 
 @torch.no_grad()
-def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
+def start_generate(model, input_ids, past_key_values):
     outputs = model(
         input_ids=input_ids,
         past_key_values=past_key_values,
         use_cache=True,
+        output_hidden_states=True,
     )
     past_key_values = outputs.past_key_values
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    generated_ids = [pred_token_idx.item()]
+    embeddings = outputs.hidden_states[0]
+    return past_key_values, pred_token_idx, embeddings
+
+
+@torch.no_grad()
+def greedy_generate(model, tokenizer, past_key_values, pred_token_idx, embeddings, max_gen_len):
     pos = 0
+    generated_ids = [pred_token_idx.item()]
     for _ in range(max_gen_len - 1):
         outputs = model(
             input_ids=pred_token_idx,
             past_key_values=past_key_values,
             use_cache=True,
+            output_hidden_states=True,
         )
         past_key_values = outputs.past_key_values
         pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
         generated_ids.append(pred_token_idx.item())
+        embeddings = torch.cat([embeddings, outputs.hidden_states[0]], dim=1)
         generated_text = (
             tokenizer.decode(
                 generated_ids,
@@ -54,24 +61,35 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
         if pred_token_idx == tokenizer.eos_token_id:
             break
     print(" ".join(generated_text[pos:]), flush=True)
-    return past_key_values
+    return past_key_values, embeddings
 
 
 @torch.no_grad()
 def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
     past_key_values = None
-    for idx, prompt in enumerate(prompts):
+    past_embeddings = None
+    while True:
+        prompt = input("Your prompt ('quit' to exit): ")
+        if prompt == "quit":
+            break
         prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
+        print("\n\nASSISTANT: ", end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to(model.device)
+        input_ids = input_ids.to('cuda')
         seq_len = input_ids.shape[1]
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
-            past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+            past_key_values = kv_cache.evict_for_space_db(
+                past_key_values, past_embeddings, space_needed)
 
-        past_key_values = greedy_generate(
-            model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
+        past_key_values, pred_token_idx, embeddings = start_generate(
+            model, input_ids, past_key_values)
+
+        past_key_values = kv_cache.add_relevant_kv_to_cache(
+                past_key_values, embeddings, 5)
+
+        past_key_values, past_embeddings = greedy_generate(
+            model, tokenizer, past_key_values, pred_token_idx, embeddings, max_gen_len=max_gen_len
         )
 
 
@@ -95,7 +113,7 @@ def main(args):
 
     if args.enable_streaming:
         kv_cache = enable_streaming_llm(
-            model, start_size=args.start_size, recent_size=args.recent_size
+            model, start_size=args.start_size, recent_size=args.recent_size, use_retrieval=args.use_retrieval
         )
     else:
         kv_cache = None
@@ -117,6 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_streaming", action="store_true")
     parser.add_argument("--start_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=2000)
+    parser.add_argument("--use_retrieval", action="store_true")
     args = parser.parse_args()
 
     main(args)

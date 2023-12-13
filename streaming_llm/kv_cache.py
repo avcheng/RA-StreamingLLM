@@ -17,7 +17,6 @@ def slice3d(x, start, end):
 def slice1d(x, start, end):
     return x[:, start:end, ...]
 
-
 DIM_TO_SLICE = {
     1: slice1d,
     2: slice2d,
@@ -119,24 +118,9 @@ class StartRecentKVCache:
         """
         # Store k-v pairs in redis
         stacked_cache = torch.stack([torch.stack((k, v)) for (k, v) in kv_cache])
-        print(f"Shape of stacked_cache {stacked_cache.size()}")
-        print(f"Dtype of stacked_cache {stacked_cache.dtype}")
-        print(f"Size of stacked_cache: {stacked_cache.element_size() * stacked_cache.nelement()}")
-        
-        # Serialize the tensor to a bytestring
-        bytestring_buffer = io.BytesIO()
-        torch.save(stacked_cache.flatten().tolist(), bytestring_buffer)
-
-        # Get the bytestring from the buffer
-        bytestring = bytestring_buffer.getvalue()
-        print(f"bytestring {len(bytestring)} bytes long...")
-        self.redis_id += 1
-
-        obj = pickle.dumps(stacked_cache.flatten())
+        obj = pickle.dumps(stacked_cache)
         while True:
             try:
-                # break
-                # TODO Need to reduce memory requirements for serialized object because it is too big rn
                 self.redis_client.set(self.redis_id, obj)
                 break
             except redis.exceptions.ConnectionError:
@@ -146,6 +130,7 @@ class StartRecentKVCache:
         # Add document embedding to index
         doc_emb = embedding.mean(dim=(0, 1)).flatten()
         self.collection.add([str(self.redis_id)], [doc_emb.tolist()])
+        self.redis_id += 1
         print(f"{self.collection.count()} documents in collection")
 
     def add_relevant_kv_to_cache(self, past_key_values, embeddings: torch.Tensor, n):
@@ -156,48 +141,19 @@ class StartRecentKVCache:
             n (int): number of nearest neighbors to return
         """
         if self.use_retrieval:
+            # Retrieve stored kv batches based on prompt embedding
             prompt_embedding = embeddings.mean(dim=1).flatten()
             nearest_neighbors = self.get_nearest_neighbors(prompt_embedding, n)
-            neighbor_tensors = []
-            for neighbor in reversed(nearest_neighbors):
-                # kv_cache = torch.frombuffer(neighbor, dtype=torch.float16)
-                kv_cache = pickle.loads(neighbor)
-                kv_cache = kv_cache.reshape(40, 2, 1, 40, -1, 128)
-                neighbor_tensors.append(kv_cache)
-                print(kv_cache.size())
 
-            if neighbor_tensors:
-                neighbor_tensors = torch.cat(neighbor_tensors, dim=-2)
-
+            if nearest_neighbors:
+                # Concatonate batches along the batch axis
+                neighbor_tensors = [pickle.loads(neighbor) for neighbor in reversed(nearest_neighbors)]
                 pkv = torch.stack([torch.stack((k, v)) for (k, v) in past_key_values])
-                pkv = torch.cat([pkv[:, :, :, :, :4, :], neighbor_tensors, pkv[:, :, :, :, 4:, :]], dim=-2)
-                print(f"Shape of pkv {pkv.size()}")
-                past_key_values = map(lambda x: (x[0], x[1]), list(pkv))
-        return list(past_key_values)
+                pkv = torch.cat([pkv[:, :, :, :, :4, :]] + neighbor_tensors + [pkv[:, :, :, :, 4:, :]], dim=-2)
 
-        # return [
-        #     [
-        #         torch.cat(
-        #             [
-        #                 self.k_slice(k, 0, self.start_size),
-        #                 self.k_slice(
-        #                     k, seq_len - self.recent_size + num_coming, seq_len
-        #                 ),
-        #             ],
-        #             dim=self.k_seq_dim,
-        #         ),
-        #         torch.cat(
-        #             [
-        #                 self.v_slice(v, 0, self.start_size),
-        #                 self.v_slice(
-        #                     v, seq_len - self.recent_size + num_coming, seq_len
-        #                 ),
-        #             ],
-        #             dim=self.v_seq_dim,
-        #         ),
-        #     ]
-        #     for k, v in past_key_values
-        # ]
+                # Map from tensor to Tuple[Tuple[Tensor]]
+                past_key_values = list(map(lambda x: (x[0], x[1]), list(pkv)))
+        return past_key_values
 
     def evict_for_space(self, past_key_values, num_coming):
         if past_key_values is None:
@@ -238,11 +194,9 @@ class StartRecentKVCache:
             print(f"Embedding size {past_emb.mean(dim=(0, 1)).size()}")
             return past_key_values
 
+        print("Evicting")
         if self.use_retrieval:
-            # past_emb should have length equal to all the new tokens that were passed in
             num_new_tokens = past_emb.size(1)
-            print(f"{num_new_tokens} new tokens")
-
             for batch in range(num_new_tokens // BATCH_SIZE):
                 evicted_kv = [
                     [

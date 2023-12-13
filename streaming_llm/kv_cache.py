@@ -1,9 +1,18 @@
 import pickle
 import sys
+import os
 
-import chromadb
-import redis
 import torch
+
+import pinecone
+from dotenv import load_dotenv
+
+load_dotenv()   
+
+pinecone.init(      
+	api_key=os.getenv('PINECONE_API_KEY'),      
+	environment='gcp-starter'      
+)      
 
 
 def slice2d(x, start, end):
@@ -45,13 +54,11 @@ class StartRecentKVCache:
         self.v_seq_dim = v_seq_dim
         self.k_slice = DIM_TO_SLICE[k_seq_dim]
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
+        self.index = pinecone.Index('65940')
 
         self.use_retrieval = use_retrieval
         if self.use_retrieval:
-            self.redis_id = 0
-            self.redis_client = self.reset_redis_connection()
-            self.redis_client.ping()
-            self.collection = chromadb.Client().create_collection(name="kv_cache")
+            self.db_id = 0
 
     def __call__(self, past_key_values):
         if past_key_values is None:
@@ -79,36 +86,7 @@ class StartRecentKVCache:
             for k, v in past_key_values
         ]
 
-    # TODO Might not need this in the future
-    def reset_redis_connection(self):
-        return redis.Redis(
-            host='localhost',
-            port=6379,
-            decode_responses=True,
-            health_check_interval=15,
-            socket_keepalive=True,
-        )
-
-    def get_nearest_neighbors(self, prompt_embedding: torch.Tensor, n: int):
-        """Returns the n nearest neighbors to the prompt embedding
-
-        Args:
-            prompt_embedding (torch.Tensor): embedding of the prompt
-            n (int): number of nearest neighbors to return
-
-        Returns:
-            list: list kv caches of nearest neighbors
-        """
-        # Generate query to find n nearest neighbors
-        results = self.collection.query(
-            query_embeddings=[prompt_embedding.tolist()],
-            n_results=n
-        )
-
-        # TODO results["ids"] is a list of list of ids so figure out how to get the ids that we want
-        return [self.redis_client.get(id) for id in results["ids"][0]]
-
-    def add_to_kv_redis_cache(self, kv_cache, embedding: torch.Tensor):
+    def add_to_kv_pinecone(self, kv_cache, embedding: torch.Tensor):
         """Adds the kv cache and embedding to redis
 
         Args:
@@ -116,22 +94,14 @@ class StartRecentKVCache:
             embedding (torch.Tensor): embedding of the k-v pairs
         """
         # Store k-v pairs in redis
-        serialized = pickle.dumps(kv_cache)
-        print(f"{len(serialized)} bytes long...")
-        self.redis_id += 1
-        while True:
-            try:
-                pass
-                # TODO Need to reduce memory requirements for serialized object because it is too big rn
-                self.redis_client.set(self.redis_id, serialized)
-                break
-            except redis.exceptions.ConnectionError:
-                print("Redis connection error, resetting connection")
-                self.redis_client = self.reset_redis_connection()
-
-        # Add document embedding to index
-        self.collection.add(self.redis_id, embedding.tolist())
-        print(f"{self.collection.count()} documents in collection")
+        print(kv_cache)
+        # print(f"{len(serialized)} bytes long...")
+        self.db_id += 1
+        self.index.upsert(
+            id=self.db_id,
+            values=embedding.tolist(),
+            metadata={'tokens': kv_cache},
+        )
 
     def add_relevant_kv_to_cache(self, past_key_values, embeddings: torch.Tensor, n):
         """Adds the n nearest neighbors to the cache
@@ -142,36 +112,38 @@ class StartRecentKVCache:
         """
         if self.use_retrieval:
             prompt_embedding = embeddings.mean(dim=1).flatten()
-            nearest_neighbors = self.get_nearest_neighbors(prompt_embedding, n)
-            for neighbor in nearest_neighbors:
-                kv_cache = pickle.loads(neighbor)
+            nearest_neighbors = self.index.query(
+                vector=prompt_embedding,
+                top_k=n, 
+                include_metadata=True
+            )
+            for neighbor in nearest_neighbors['matches']:
+                kv_cache = neighbor['metadata']['tokens']
+                cache_length = len(kv_cache)
                 print(len(kv_cache))
+                # make space for the new tokens
+                past_key_values = self.evict_for_space(past_key_values, cache_length)
+                # loop through the past key values and add the new tokens after the first self.start_size tokens
+                for i, (k, v) in enumerate(past_key_values):
+                    past_key_values[i][0] = torch.cat(
+                        [
+                            self.k_slice(k, 0, self.start_size),
+                            torch.tensor(kv_cache[i][0]),
+                            self.k_slice(k, self.start_size, self.recent_size),
+                        ],
+                        dim=self.k_seq_dim,
+                    )
+                    past_key_values[i][1] = torch.cat(
+                        [
+                            self.v_slice(v, 0, self.start_size),
+                            torch.tensor(kv_cache[i][1]),
+                            self.v_slice(v, self.start_size, self.recent_size),
+                        ],
+                        dim=self.v_seq_dim,
+                    )
+                    
 
         return past_key_values
-
-        # return [
-        #     [
-        #         torch.cat(
-        #             [
-        #                 self.k_slice(k, 0, self.start_size),
-        #                 self.k_slice(
-        #                     k, seq_len - self.recent_size + num_coming, seq_len
-        #                 ),
-        #             ],
-        #             dim=self.k_seq_dim,
-        #         ),
-        #         torch.cat(
-        #             [
-        #                 self.v_slice(v, 0, self.start_size),
-        #                 self.v_slice(
-        #                     v, seq_len - self.recent_size + num_coming, seq_len
-        #                 ),
-        #             ],
-        #             dim=self.v_seq_dim,
-        #         ),
-        #     ]
-        #     for k, v in past_key_values
-        # ]
 
     def evict_for_space(self, past_key_values, num_coming):
         if past_key_values is None:
@@ -235,7 +207,7 @@ class StartRecentKVCache:
                 ]
                 evicted_emb = past_emb[:, batch *
                                        BATCH_SIZE:(batch + 1) * BATCH_SIZE, :]
-                self.add_to_kv_redis_cache(evicted_kv, evicted_emb)
+                self.add_to_kv_pinecone(evicted_kv, evicted_emb)
 
         return [
             [
@@ -285,3 +257,6 @@ class StartRecentKVCache:
             ]
             for k, v in past_key_values
         ]
+    
+    def delete_index(self):
+        pinecone.delete_index('65940')

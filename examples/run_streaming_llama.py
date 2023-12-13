@@ -10,8 +10,6 @@ import argparse
 import torch
 import warnings
 
-warnings.filterwarnings("ignore")
-
 
 @torch.no_grad()
 def start_generate(model, input_ids, past_key_values):
@@ -71,12 +69,15 @@ def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=10
     while True:
         prompt = input("Your prompt ('quit' to exit): ")
         if prompt == "quit":
+            if kv_cache is not None:
+                kv_cache.delete_index()
             break
         prompt = "USER: " + prompt + "\n\nASSISTANT: "
         print("\n\nASSISTANT: ", end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to('cuda')
+        input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
+        
         if kv_cache is not None:
             space_needed = seq_len + max_gen_len
             past_key_values = kv_cache.evict_for_space_db(

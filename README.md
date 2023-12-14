@@ -1,3 +1,7 @@
+# Supporting Longer Contexts on StreamingLLM with RAG
+
+This fork of StreamingLLM extends the framework to remember context tokens that have been evicted from its current context window. The end goal is enabling LLMs to have "longer-term memory" by remembering older pieces of information in a long-standing conversation. We achieve this by using retrieval-augmented generation (RAG) to store evicted tokens in an additional global database that can then be queried during inference.
+
 # Efficient Streaming Language Models with Attention Sinks 
 [[paper](http://arxiv.org/abs/2309.17453)] [[slides](assets/StreamingLLM.pdf)][[video](https://youtu.be/hvJsEzP34o8)]
 

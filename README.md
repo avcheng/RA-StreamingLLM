@@ -7,6 +7,21 @@ This fork of StreamingLLM extends the framework to remember context tokens that 
 ## Abstract
 StreamingLLM was created as an efficient framework to enables large language models (LLMs) trained with a finite length attention window to generalize to infinite sequence lengths without fine-tuning. However, one limitation of StreamingLLM is its inability to consider previously evicted tokens. The result is a potential memory lapse of items outside of the current window. In this paper, we use concepts from Retrieval Augmented Generation (RAG) to enable infinite-length content storage to improve StreamingLLM's memory. Through our ad hoc testing, we determine that our RA-StreamingLLM maintains infinite window processing and coherence while enhancing accuracy and relevance relative to StreamingLLM when a user inputs long prompts or a series of prompts. 
 
+## Demo
+
+We see with StreamingLLM, context is forgotten after the tokens are evicted from the context window. In this case, the model is not able to remember that the user's name.
+
+
+https://github.com/avcheng/RA-StreamingLLM/assets/54912191/879245f3-aac8-4df5-946d-a255cb9dd380
+
+
+We see with RA-StreamingLLM, context is remembered after the tokens are evicted from the context window. In this case, the model is able to remember that the user's name is Kevin.
+
+
+https://github.com/avcheng/RA-StreamingLLM/assets/54912191/5dd27af3-997d-4223-a00c-6390008fd8e2
+
+
+
 ## Usage
 
 ### Environment Setup
